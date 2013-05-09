@@ -14,16 +14,16 @@
 #define QUEUE_SIZE 8
 
 typedef struct {
-	int dummy;
+    int dummy;
 } fshmem_node;
 
 typedef struct {
 
-	/* QUEUE (circular buffer) */
-	int producer; // increment by user
-	int consumer; // increment by driver
-	fshmem_node queue[QUEUE_SIZE];
-	unsigned int mask;
+    /* QUEUE (circular buffer) */
+    int producer; // increment by user
+    int consumer; // increment by driver
+    fshmem_node queue[QUEUE_SIZE];
+    unsigned int mask;
 
 } fshmem_context;
 
