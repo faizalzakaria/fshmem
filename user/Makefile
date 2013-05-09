@@ -13,6 +13,8 @@ CFLAGS  += -Wall -Werror
 CFLAGS  += -g
 CFLAGS  += -I$(PWD)/../include
 
+LDFLAGS = -lpthread
+
 $(warning ${CFLAGS})
 
 .PHONY: all

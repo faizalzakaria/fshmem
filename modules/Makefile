@@ -7,6 +7,8 @@ VERSION_H := $(wildcard $(KERNEL_DIR)/include/linux/version.h)
 AUTOCONF_H := $(wildcard $(KERNEL_DIR)/include/linux/autoconf.h)
 UTSRELEASE_H := $(wildcard $(KERNEL_DIR)/include/linux/utsrelease.h)
 
+EXTRA_CFLAGS += -I$(PWD)/../include
+
 .PHONY: all clean build
 obj-m := fshmem.o
 

@@ -10,6 +10,11 @@
 #include <linux/mman.h>
 #include <linux/cdev.h>
 #include <linux/fs.h>
+#include <linux/poll.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
+
+#include "fshmem.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("FAIZAL ZAKARIA");
@@ -28,6 +33,11 @@ typedef struct {
 	void * pSMemP;
 	void * pSMemK;
 	size_t memSize;
+
+	wait_queue_head_t readQueue;
+	int dataAvailable;
+
+	fshmem_context *evtQ;
 } fshmem_cdev;
 
 /******************************************************************************/
@@ -36,6 +46,7 @@ typedef struct {
 
 static fshmem_cdev * pDevInfo;
 static dev_t stDev;
+static volatile bool exitTask;
 
 /******************************************************************************/
 /******************************* Static functions *****************************/
@@ -44,6 +55,7 @@ static dev_t stDev;
 static int fshmem_open(struct inode * inode, struct file * file);
 static int fshmem_release(struct inode * inode, struct file * file);
 static int fshmem_mmap(struct file *file, struct vm_area_struct *vma);
+static unsigned int fshmem_poll(struct file *file, poll_table *wait);
 
 /* fops */
 static struct file_operations fileOps = {
@@ -51,7 +63,7 @@ static struct file_operations fileOps = {
    .open           = fshmem_open,       /* open method        */
    .release        = fshmem_release,     /* release method     */
    .mmap           = fshmem_mmap,        /* mmap method         */
-//   .poll           = fshmem_poll,        /* Poll method        */
+   .poll           = fshmem_poll,        /* Poll method        */
 };
 
 /******************************************************************************/
@@ -65,7 +77,14 @@ static void fshmem_init_dev(fshmem_cdev *pDev) {
 	pDev->pSMemK = NULL;
 	pDev->memSize = 0;
 	pDev->usersCnt = 0;
+
+	init_waitqueue_head(&pDev->readQueue);
+	pDev->dataAvailable = 0;
+
+	pDev->evtQ = NULL;
 }
+
+/******************************************************************************/
 
 static int fshmem_get_memory(fshmem_cdev *pDev, size_t iSize) {
 
@@ -79,6 +98,7 @@ static int fshmem_get_memory(fshmem_cdev *pDev, size_t iSize) {
 			return(-ENOMEM);
 		}
 
+		/* align memory */
 		pDev->pSMemP = (void *)(((unsigned long) pDev->pSMemK + PAGE_SIZE - 1) & PAGE_MASK);
 		pDev->memSize = iSize;
 
@@ -88,6 +108,9 @@ static int fshmem_get_memory(fshmem_cdev *pDev, size_t iSize) {
 			 virt_addr += PAGE_SIZE) {
 			SetPageReserved(virt_to_page((void *) virt_addr));
 		}
+
+		printk("shared memory unaligned : 0x%p\n", pDev->pSMemK);
+		printk("shared memory aligned : 0x%p\n", pDev->pSMemP);
 
 		memset(pDev->pSMemP, 0, iSize);
 	}
@@ -100,8 +123,9 @@ static int fshmem_get_memory(fshmem_cdev *pDev, size_t iSize) {
 	return(0);
 }
 
+/******************************************************************************/
+
 static void fshmem_free_memory(fshmem_cdev *pDev) {
-	printk("%s : %dFreeing memory\n", __func__, __LINE__);
 	if (pDev->pSMemP) {
 		unsigned long virt_addr;
 
@@ -114,8 +138,11 @@ static void fshmem_free_memory(fshmem_cdev *pDev) {
 		pDev->pSMemP = NULL;
 		pDev->pSMemK = NULL;
 		pDev->memSize = 0;
+		pDev->evtQ = NULL;
 	}
 }
+
+/******************************************************************************/
 
 static int fshmem_open(struct inode * inode, struct file * file) {
 	int ret = -ENODEV;
@@ -133,6 +160,8 @@ static int fshmem_open(struct inode * inode, struct file * file) {
 	return ret;
 }
 
+/******************************************************************************/
+
 static int fshmem_release(struct inode * inode, struct file * file) {
 	fshmem_cdev * pDev = (fshmem_cdev *) container_of(inode->i_cdev, fshmem_cdev, cdev);
 
@@ -141,6 +170,30 @@ static int fshmem_release(struct inode * inode, struct file * file) {
 	mutex_unlock(&(pDev->lock));
 	return 0;
 }
+
+/******************************************************************************/
+
+static unsigned int fshmem_poll(struct file *file, poll_table *wait) {
+
+	fshmem_cdev *pDev = file->private_data;
+	unsigned int mask = 0;
+
+	printk("%s : %d\n", __func__, __LINE__);
+
+	mutex_lock(&(pDev->lock));
+
+	if (pDev->dataAvailable) mask |= POLLIN | POLLRDNORM; /* readable */
+
+	poll_wait(file, &pDev->readQueue, wait);
+
+	if (pDev->dataAvailable > 0) pDev->dataAvailable--;
+
+	mutex_unlock(&(pDev->lock));
+	
+	return mask;
+}
+
+/******************************************************************************/
 
 static int fshmem_mmap(struct file *file, struct vm_area_struct *vma) {
 
@@ -173,13 +226,51 @@ static int fshmem_mmap(struct file *file, struct vm_area_struct *vma) {
 		printk(KERN_CRIT "%s: Failed to lock memory ... \n", __func__);
 		return(-ENXIO);
 	}
+
+	/* got map memory */
+	pDev->evtQ = (fshmem_context *) pDev->pSMemP;
+	pDev->evtQ->mask = QUEUE_SIZE - 1;
+
 	return 0;
 }
+
+/******************************************************************************/
+
+static int fshmem_task(void* arg) {
+
+	fshmem_cdev *pDev = (fshmem_cdev *) arg;
+	int cnt = 0;
+
+	while (!exitTask) {
+		// do dummy stuff
+		fshmem_node node;
+
+		msleep(1000);
+		
+		if (pDev->evtQ != NULL) {
+			// just dummy data
+			node.dummy = cnt;
+			cnt = (cnt + 1) & pDev->evtQ->mask;
+			
+			pDev->evtQ->queue[pDev->evtQ->producer] = node;
+			pDev->evtQ->producer = (pDev->evtQ->producer + 1) & pDev->evtQ->mask;
+			pDev->dataAvailable++;
+			wake_up(&(pDev->readQueue));
+		}
+	}
+
+	exitTask = false;
+	return 0;
+}
+
+/******************************************************************************/
 
 static int fshmem_init(void) {
 	int ret;
 
 	printk("%s : Initialising driver ... \n", __func__);
+
+	printk("%08x %08x\n", PAGE_MASK, PAGE_SIZE);
 
 	if (alloc_chrdev_region(&stDev, 0, 1, DEVICE_NAME) < 0) {
 		printk(KERN_ERR "%s: Failed to register device %s\n", __func__, DEVICE_NAME);
@@ -203,12 +294,21 @@ static int fshmem_init(void) {
 		return ret;
 	}
 
+	exitTask = false;
+	kthread_run(fshmem_task, (void *) pDevInfo, "FSHMEM_DUMMY");
+
 	return 0;
 }
+
+/******************************************************************************/
 
 static void fshmem_exit(void) {
 
 	printk("%s : Exiting driver ... \n", __func__);
+
+	exitTask = true;
+	// wait for task to exit
+	msleep(100);
 
 	mutex_destroy(&(pDevInfo->lock));
 	pDevInfo->usersCnt = 0;
@@ -217,6 +317,8 @@ static void fshmem_exit(void) {
 	unregister_chrdev_region(stDev, 1);
 	fshmem_free_memory(pDevInfo);
 }
+
+/******************************************************************************/
 
 module_init(fshmem_init);
 module_exit(fshmem_exit);
