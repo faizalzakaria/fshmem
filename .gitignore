@@ -1,0 +1,12 @@
+*.mod.*
+*.ko
+*.o
+*.d
+*.cmd
+*.cmd
+*.symvers
+*.tmp_versions
+*modules.order
+user/fshmem
+
+
